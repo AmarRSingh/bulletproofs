@@ -1,10 +1,9 @@
 #![allow(non_snake_case)]
 
-use curve25519_dalek::ristretto::RistrettoPoint;
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::VartimeMultiscalarMul;
 use merlin::Transcript;
-use rand::{CryptoRng, Rng};
 
 use super::assignment::Assignment;
 use super::{ConstraintSystem, LinearCombination, R1CSProof, Variable};
@@ -13,14 +12,15 @@ use errors::R1CSError;
 use generators::Generators;
 use transcript::TranscriptProtocol;
 
-pub struct VerifierCS<'a> {
+pub struct VerifierCS<'a, 'b> {
     transcript: &'a mut Transcript,
+    generators: &'b Generators,
     constraints: Vec<LinearCombination>,
     num_vars: usize,
-    V: Vec<RistrettoPoint>,
+    V: Vec<CompressedRistretto>,
 }
 
-impl<'a> ConstraintSystem for VerifierCS<'a> {
+impl<'a, 'b> ConstraintSystem for VerifierCS<'a, 'b> {
     fn assign_multiplier(
         &mut self,
         _left: Assignment,
@@ -58,11 +58,11 @@ impl<'a> ConstraintSystem for VerifierCS<'a> {
     }
 }
 
-impl<'a> VerifierCS<'a> {
+impl<'a, 'b> VerifierCS<'a, 'b> {
     pub fn new(
         transcript: &'a mut Transcript,
-        // XXX should these take compressed points?
-        commitments: Vec<RistrettoPoint>,
+        generators: &'b Generators,
+        commitments: Vec<CompressedRistretto>,
     ) -> (Self, Vec<Variable>) {
         let m = commitments.len();
         transcript.r1cs_domain_sep(m as u64);
@@ -70,7 +70,7 @@ impl<'a> VerifierCS<'a> {
         let mut variables = Vec::with_capacity(m);
         for (i, commitment) in commitments.iter().enumerate() {
             // Commit the commitment to the transcript
-            transcript.commit_point(b"V", &commitment.compress());
+            transcript.commit_point(b"V", &commitment);
 
             // Allocate and return a variable for the commitment
             variables.push(Variable::Committed(i));
@@ -78,6 +78,7 @@ impl<'a> VerifierCS<'a> {
 
         let cs = VerifierCS {
             transcript,
+            generators,
             num_vars: 0,
             V: commitments,
             constraints: Vec::new(),
@@ -112,7 +113,7 @@ impl<'a> VerifierCS<'a> {
 
         let mut exp_z = *z;
         for lc in self.constraints.iter() {
-            for (var, coeff) in &lc.variables {
+            for (var, coeff) in &lc.terms {
                 match var {
                     Variable::MultiplierLeft(i) => {
                         z_zQ_WL[*i] += exp_z * coeff;
@@ -126,10 +127,11 @@ impl<'a> VerifierCS<'a> {
                     Variable::Committed(i) => {
                         z_zQ_WV[*i] -= exp_z * coeff;
                     }
+                    Variable::One() => {
+                        z_zQ_c -= exp_z * coeff;
+                    }
                 }
             }
-            z_zQ_c -= exp_z * lc.constant;
-
             exp_z *= z;
         }
 
@@ -137,12 +139,7 @@ impl<'a> VerifierCS<'a> {
     }
 
     // This function can only be called once per ConstraintSystem instance.
-    pub fn verify<R: Rng + CryptoRng>(
-        mut self,
-        proof: &R1CSProof,
-        generators: &Generators,
-        rng: &mut R,
-    ) -> Result<(), R1CSError> {
+    pub fn verify(mut self, proof: &R1CSProof) -> Result<(), R1CSError> {
         let temp_n = self.num_vars;
         if !(temp_n == 0 || temp_n.is_power_of_two()) {
             let pad = temp_n.next_power_of_two() - temp_n;
@@ -156,11 +153,18 @@ impl<'a> VerifierCS<'a> {
         use util;
 
         let n = self.num_vars;
-        if generators.gens_capacity < n {
+        if self.generators.gens_capacity < n {
             return Err(R1CSError::InvalidGeneratorsLength);
         }
         // We are performing a single-party circuit proof, so party index is 0.
-        let gens = generators.share(0);
+        let gens = self.generators.share(0);
+
+        // Create a `TranscriptRng` from the transcript
+        use rand::thread_rng;
+        let mut rng = self
+            .transcript
+            .fork_transcript()
+            .reseed_from_rng(&mut thread_rng());
 
         self.transcript.commit_point(b"A_I", &proof.A_I);
         self.transcript.commit_point(b"A_O", &proof.A_O);
@@ -187,43 +191,8 @@ impl<'a> VerifierCS<'a> {
 
         let w = self.transcript.challenge_scalar(b"w");
 
-        let r = Scalar::random(rng);
+        let r = Scalar::random(&mut rng);
         let xx = x * x;
-
-        // Decompress points
-        let S = proof
-            .S
-            .decompress()
-            .ok_or_else(|| R1CSError::InvalidProofPoint)?;
-        let A_I = proof
-            .A_I
-            .decompress()
-            .ok_or_else(|| R1CSError::InvalidProofPoint)?;
-        let A_O = proof
-            .A_O
-            .decompress()
-            .ok_or_else(|| R1CSError::InvalidProofPoint)?;
-        let T_1 = proof
-            .T_1
-            .decompress()
-            .ok_or_else(|| R1CSError::InvalidProofPoint)?;
-        let T_3 = proof
-            .T_3
-            .decompress()
-            .ok_or_else(|| R1CSError::InvalidProofPoint)?;
-        let T_4 = proof
-            .T_4
-            .decompress()
-            .ok_or_else(|| R1CSError::InvalidProofPoint)?;
-        let T_5 = proof
-            .T_5
-            .decompress()
-            .ok_or_else(|| R1CSError::InvalidProofPoint)?;
-        let T_6 = proof
-            .T_6
-            .decompress()
-            .ok_or_else(|| R1CSError::InvalidProofPoint)?;
-
         let y_inv = y.invert();
 
         // Calculate points that represent the matrices
@@ -263,31 +232,18 @@ impl<'a> VerifierCS<'a> {
 
         // group the T_scalars and T_points together
         let T_scalars = [r * x, rxx * x, rxx * xx, rxx * xx * x, rxx * xx * xx];
-        let T_points = [T_1, T_3, T_4, T_5, T_6];
+        let T_points = [proof.T_1, proof.T_3, proof.T_4, proof.T_5, proof.T_6];
 
-        // Decompress L and R points from inner product proof
-        let Ls = proof
-            .ipp_proof
-            .L_vec
-            .iter()
-            .map(|p| p.decompress().ok_or(R1CSError::InvalidProofPoint))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let Rs = proof
-            .ipp_proof
-            .R_vec
-            .iter()
-            .map(|p| p.decompress().ok_or(R1CSError::InvalidProofPoint))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mega_check = RistrettoPoint::vartime_multiscalar_mul(
+        let mega_check = RistrettoPoint::optional_multiscalar_mul(
             iter::once(x) // A_I
                 .chain(iter::once(xx)) // A_O
                 .chain(iter::once(x)) // W_L_point
                 .chain(iter::once(x)) // W_R_point
                 .chain(z_zQ_WO.iter().cloned()) // H_prime
                 .chain(iter::once(x * xx)) // S
-                .chain(iter::once(w * (proof.t_x - a * b) + r * (xx * (delta + z_zQ_c) - proof.t_x))) // B
+                .chain(iter::once(
+                    w * (proof.t_x - a * b) + r * (xx * (delta + z_zQ_c) - proof.t_x),
+                )) // B
                 .chain(iter::once(-proof.e_blinding - r * proof.t_x_blinding)) // B_blinding
                 .chain(g) // G
                 .chain(h) // H
@@ -295,22 +251,22 @@ impl<'a> VerifierCS<'a> {
                 .chain(x_inv_sq.iter().cloned()) // ipp_proof.R_vec
                 .chain(V_coeff) // V
                 .chain(T_scalars.iter().cloned()), // T_points
-            iter::once(&A_I)
-                .chain(iter::once(&A_O))
-                .chain(iter::once(&W_L_point))
-                .chain(iter::once(&W_R_point))
+            iter::once(proof.A_I.decompress())
+                .chain(iter::once(proof.A_O.decompress()))
+                .chain(iter::once(Some(W_L_point)))
+                .chain(iter::once(Some(W_R_point)))
                 // W_O_point = <h * y^-n , z * z^Q * W_O>, line 83
-                .chain(H_prime.iter())
-                .chain(iter::once(&S))
-                .chain(iter::once(&gens.pedersen_gens.B))
-                .chain(iter::once(&gens.pedersen_gens.B_blinding))
-                .chain(gens.G(n))
-                .chain(gens.H(n))
-                .chain(Ls.iter())
-                .chain(Rs.iter())
-                .chain(self.V.iter())
-                .chain(T_points.iter()),
-        );
+                .chain(H_prime.iter().map(|&H_prime_i| Some(H_prime_i)))
+                .chain(iter::once(proof.S.decompress()))
+                .chain(iter::once(Some(gens.pedersen_gens.B)))
+                .chain(iter::once(Some(gens.pedersen_gens.B_blinding)))
+                .chain(gens.G(n).map(|&G_i| Some(G_i)))
+                .chain(gens.H(n).map(|&H_i| Some(H_i)))
+                .chain(proof.ipp_proof.L_vec.iter().map(|L_i| L_i.decompress()))
+                .chain(proof.ipp_proof.R_vec.iter().map(|R_i| R_i.decompress()))
+                .chain(self.V.iter().map(|V_i| V_i.decompress()))
+                .chain(T_points.iter().map(|T_i| T_i.decompress())),
+        ).ok_or_else(|| R1CSError::VerificationError)?;
 
         use curve25519_dalek::traits::IsIdentity;
 
