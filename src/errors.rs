@@ -99,6 +99,9 @@ pub enum R1CSError {
     /// Occurs when there are insufficient generators for the proof.
     #[fail(display = "Invalid generators size, too few generators for proof")]
     InvalidGeneratorsLength,
+    /// Occurs when the ConstraintSystem is not constructed properly.
+    #[fail(display = "Invalid R1CS construction.")]
+    InvalidR1CSConstruction,
     /// Occurs when trying to use a missing variable assignment, for
     /// instance if
     /// [`Assignment::Missing`](::r1cs::Assignment::Missing) is passed
